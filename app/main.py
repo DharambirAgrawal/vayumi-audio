@@ -1,5 +1,7 @@
+import asyncio
 import io
 import os
+import re
 from functools import lru_cache
 
 import numpy as np
@@ -26,6 +28,24 @@ app.add_middleware(
 
 # Loaded once at process startup, reused for every request.
 kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
+
+# One ONNX inference at a time — concurrent calls compete for CPU and raise latency.
+_synth_sem = asyncio.Semaphore(1)
+
+_STREAM_HEADERS = {
+    "X-Sample-Rate": str(SAMPLE_RATE),
+    "X-Sample-Format": "s16le",
+    "X-Channels": "1",
+    "X-Accel-Buffering": "no",
+    "Cache-Control": "no-cache, no-store",
+}
+
+_SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts = _SENTENCE_RE.split(text.strip())
+    return [p.strip() for p in parts if p.strip()] or [text.strip()]
 
 
 class TTSRequest(BaseModel):
@@ -73,18 +93,22 @@ async def tts_stream(req: TTSRequest):
         raise HTTPException(status_code=400, detail="text must not be empty")
 
     async def generate():
-        async for samples, _ in kokoro.create_stream(
-            req.text, voice=req.voice, speed=req.speed, lang=req.lang
-        ):
-            pcm16 = (samples * 32767).astype(np.int16).tobytes()
-            yield pcm16
+        sentences = _split_sentences(req.text)
+        async with _synth_sem:
+            for sentence in sentences:
+                async for samples, _ in kokoro.create_stream(
+                    sentence,
+                    voice=req.voice,
+                    speed=req.speed,
+                    lang=req.lang,
+                ):
+                    pcm16 = (samples * 32767).astype(np.int16).tobytes()
+                    yield pcm16
+                    # Yield to the event loop so uvicorn flushes bytes immediately.
+                    await asyncio.sleep(0)
 
     return StreamingResponse(
         generate(),
         media_type="application/octet-stream",
-        headers={
-            "X-Sample-Rate": str(SAMPLE_RATE),
-            "X-Sample-Format": "s16le",
-            "X-Channels": "1",
-        },
+        headers=_STREAM_HEADERS,
     )

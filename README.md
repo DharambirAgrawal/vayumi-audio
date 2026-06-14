@@ -31,7 +31,7 @@ Text-to-speech microservice for the Vayumi project, powered by [Kokoro](https://
   }
   ```
 
-- `POST /tts/stream` — same request body, streams raw PCM16LE audio chunks as they're generated for low-latency playback. Response headers:
+- `POST /tts/stream` — same request body, streams raw PCM16LE audio chunks as they're generated for low-latency playback. Text is split by sentence so the first clause can play while later ones are still synthesizing. Response headers:
   - `X-Sample-Rate: 24000`
   - `X-Sample-Format: s16le`
   - `X-Channels: 1`

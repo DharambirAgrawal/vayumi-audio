@@ -88,11 +88,11 @@
   </div>
 
   <div class="actions">
-    <button id="genBtn">Generate</button>
-    <button id="streamBtn" class="secondary">Stream</button>
+    <button id="speakBtn">Speak</button>
+    <button id="genBtn" class="secondary">Download WAV</button>
   </div>
 
-  <audio id="player" controls></audio>
+  <audio id="player" controls hidden></audio>
   <div class="log" id="log"></div>
 </div>
 
@@ -103,13 +103,47 @@ const speedEl = document.getElementById("speed");
 const speedValEl = document.getElementById("speedVal");
 const langEl = document.getElementById("lang");
 const textEl = document.getElementById("text");
+const speakBtn = document.getElementById("speakBtn");
 const genBtn = document.getElementById("genBtn");
-const streamBtn = document.getElementById("streamBtn");
 const player = document.getElementById("player");
 const logEl = document.getElementById("log");
 
+let audioCtx = null;
+let playTime = 0;
+let speaking = false;
+
 function log(msg) {
   logEl.textContent = msg;
+}
+
+async function ensureAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === "suspended") {
+    await audioCtx.resume();
+  }
+  return audioCtx;
+}
+
+function pcm16ToFloat32(bytes) {
+  const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768;
+  }
+  return float32;
+}
+
+function scheduleChunk(float32, sampleRate) {
+  const buffer = audioCtx.createBuffer(1, float32.length, sampleRate);
+  buffer.copyToChannel(float32, 0);
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(audioCtx.destination);
+  const startAt = Math.max(playTime, audioCtx.currentTime);
+  source.start(startAt);
+  playTime = startAt + buffer.duration;
 }
 
 speedEl.addEventListener("input", () => {
@@ -156,9 +190,10 @@ async function generate() {
     if (!res.ok) throw new Error(await res.text());
     const blob = await res.blob();
     const totalMs = (performance.now() - start).toFixed(0);
+    player.hidden = false;
     player.src = URL.createObjectURL(blob);
     player.play();
-    log(`/tts done in ${totalMs}ms (${blob.size} bytes)`);
+    log(`WAV ready in ${totalMs}ms (${blob.size} bytes)`);
   } catch (e) {
     log(`Error: ${e.message}`);
   } finally {
@@ -166,12 +201,17 @@ async function generate() {
   }
 }
 
-async function stream() {
-  streamBtn.disabled = true;
+async function speak() {
+  if (speaking) return;
+  speaking = true;
+  speakBtn.disabled = true;
   const start = performance.now();
   let firstByteMs = null;
 
   try {
+    await ensureAudioCtx();
+    playTime = audioCtx.currentTime;
+
     const res = await fetch("/tts/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -180,45 +220,39 @@ async function stream() {
     if (!res.ok) throw new Error(await res.text());
 
     const sampleRate = parseInt(res.headers.get("X-Sample-Rate") || "24000", 10);
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const reader = res.body.getReader();
-    let playTime = ctx.currentTime;
     let bytes = 0;
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (firstByteMs === null) firstByteMs = (performance.now() - start).toFixed(0);
-
-      bytes += value.byteLength;
-      const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
-      const samples = value.byteLength / 2;
-      const float32 = new Float32Array(samples);
-      for (let i = 0; i < samples; i++) {
-        float32[i] = view.getInt16(i * 2, true) / 32768;
+      if (firstByteMs === null) {
+        firstByteMs = (performance.now() - start).toFixed(0);
+        log(`playing… first audio in ${firstByteMs}ms`);
       }
 
-      const buffer = ctx.createBuffer(1, float32.length, sampleRate);
-      buffer.copyToChannel(float32, 0);
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      const startAt = Math.max(playTime, ctx.currentTime);
-      source.start(startAt);
-      playTime = startAt + buffer.duration;
+      bytes += value.byteLength;
+      scheduleChunk(pcm16ToFloat32(value), sampleRate);
     }
 
     const totalMs = (performance.now() - start).toFixed(0);
-    log(`/tts/stream first chunk in ${firstByteMs}ms, total ${totalMs}ms (${bytes} bytes)`);
+    log(`done — first audio ${firstByteMs}ms, total ${totalMs}ms (${bytes} bytes)`);
   } catch (e) {
     log(`Error: ${e.message}`);
   } finally {
-    streamBtn.disabled = false;
+    speaking = false;
+    speakBtn.disabled = false;
   }
 }
 
+speakBtn.addEventListener("click", speak);
 genBtn.addEventListener("click", generate);
-streamBtn.addEventListener("click", stream);
+textEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    speak();
+  }
+});
 init();
 </script>
 </body>
