@@ -11,8 +11,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 RUN mkdir -p model/tts && \
-    wget -q -O model/tts/kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx && \
+    wget -q -O model/tts/kokoro-v1.0.int8.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx && \
     wget -q -O model/tts/voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+
+ENV KOKORO_MODEL=model/tts/kokoro-v1.0.int8.onnx
+ENV KOKORO_VOICES=model/tts/voices-v1.0.bin
 
 COPY app/ app/
 

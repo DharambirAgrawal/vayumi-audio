@@ -12,10 +12,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from kokoro_onnx import Kokoro
 from pydantic import BaseModel
 
-MODEL_PATH = "model/tts/kokoro-v1.0.onnx"
-VOICES_PATH = "model/tts/voices-v1.0.bin"
+MODEL_PATH = os.getenv("KOKORO_MODEL", "model/tts/kokoro-v1.0.int8.onnx")
+VOICES_PATH = os.getenv("KOKORO_VOICES", "model/tts/voices-v1.0.bin")
 SAMPLE_RATE = 24000
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+MAX_CHUNK_CHARS = 100
 
 app = FastAPI(title="Vayumi Audio", description="Kokoro TTS API")
 
@@ -26,10 +27,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Loaded once at process startup, reused for every request.
 kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
 
-# One ONNX inference at a time — concurrent calls compete for CPU and raise latency.
 _synth_sem = asyncio.Semaphore(1)
 
 _STREAM_HEADERS = {
@@ -40,12 +39,30 @@ _STREAM_HEADERS = {
     "Cache-Control": "no-cache, no-store",
 }
 
-_SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+")
+_CLAUSE_RE = re.compile(r"(?<=[,;:—–])\s+|(?<=[.!?…])\s+")
 
 
-def _split_sentences(text: str) -> list[str]:
-    parts = _SENTENCE_RE.split(text.strip())
-    return [p.strip() for p in parts if p.strip()] or [text.strip()]
+def _split_chunks(text: str) -> list[str]:
+    """Split text into small clauses so the first audio arrives quickly."""
+    parts = _CLAUSE_RE.split(text.strip())
+    chunks: list[str] = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        while len(part) > MAX_CHUNK_CHARS:
+            split_at = part.rfind(" ", 0, MAX_CHUNK_CHARS)
+            if split_at <= 0:
+                split_at = MAX_CHUNK_CHARS
+            chunks.append(part[:split_at].strip())
+            part = part[split_at:].strip()
+        if part:
+            chunks.append(part)
+    return chunks or [text.strip()]
+
+
+def _to_pcm16(samples: np.ndarray) -> bytes:
+    return (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
 
 class TTSRequest(BaseModel):
@@ -62,7 +79,11 @@ def dashboard():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": True}
+    return {
+        "status": "ok",
+        "model_loaded": True,
+        "model": os.path.basename(MODEL_PATH),
+    }
 
 
 @app.get("/voices")
@@ -92,20 +113,33 @@ async def tts_stream(req: TTSRequest):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text must not be empty")
 
+    chunks = _split_chunks(req.text)
+
     async def generate():
-        sentences = _split_sentences(req.text)
-        async with _synth_sem:
-            for sentence in sentences:
-                async for samples, _ in kokoro.create_stream(
-                    sentence,
-                    voice=req.voice,
-                    speed=req.speed,
-                    lang=req.lang,
-                ):
-                    pcm16 = (samples * 32767).astype(np.int16).tobytes()
-                    yield pcm16
-                    # Yield to the event loop so uvicorn flushes bytes immediately.
-                    await asyncio.sleep(0)
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=4)
+
+        async def produce():
+            async with _synth_sem:
+                for chunk_text in chunks:
+                    async for samples, _ in kokoro.create_stream(
+                        chunk_text,
+                        voice=req.voice,
+                        speed=req.speed,
+                        lang=req.lang,
+                    ):
+                        await queue.put(_to_pcm16(samples))
+            await queue.put(None)
+
+        producer = asyncio.create_task(produce())
+        try:
+            while True:
+                pcm = await queue.get()
+                if pcm is None:
+                    break
+                yield pcm
+                await asyncio.sleep(0)
+        finally:
+            await producer
 
     return StreamingResponse(
         generate(),

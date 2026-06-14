@@ -109,7 +109,6 @@ const player = document.getElementById("player");
 const logEl = document.getElementById("log");
 
 let audioCtx = null;
-let playTime = 0;
 let speaking = false;
 
 function log(msg) {
@@ -127,7 +126,14 @@ async function ensureAudioCtx() {
 }
 
 function pcm16ToFloat32(bytes) {
-  const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+  const aligned = bytes.byteOffset % 2 === 0
+    ? bytes
+    : bytes.slice();
+  const int16 = new Int16Array(
+    aligned.buffer,
+    aligned.byteOffset,
+    aligned.byteLength / 2,
+  );
   const float32 = new Float32Array(int16.length);
   for (let i = 0; i < int16.length; i++) {
     float32[i] = int16[i] / 32768;
@@ -135,15 +141,65 @@ function pcm16ToFloat32(bytes) {
   return float32;
 }
 
-function scheduleChunk(float32, sampleRate) {
-  const buffer = audioCtx.createBuffer(1, float32.length, sampleRate);
-  buffer.copyToChannel(float32, 0);
-  const source = audioCtx.createBufferSource();
-  source.buffer = buffer;
-  source.connect(audioCtx.destination);
-  const startAt = Math.max(playTime, audioCtx.currentTime);
-  source.start(startAt);
-  playTime = startAt + buffer.duration;
+/** Buffers incoming PCM and schedules gapless playback with lookahead. */
+class StreamPlayer {
+  constructor(ctx, sampleRate) {
+    this.ctx = ctx;
+    this.sampleRate = sampleRate;
+    this.pending = [];
+    this.pendingSamples = 0;
+    this.playTime = 0;
+    this.started = false;
+    this.ended = false;
+    this.minBufferSamples = Math.floor(sampleRate * 0.3);
+    this.maxAheadSec = 2.0;
+  }
+
+  reset() {
+    this.pending = [];
+    this.pendingSamples = 0;
+    this.playTime = this.ctx.currentTime;
+    this.started = false;
+    this.ended = false;
+  }
+
+  push(pcmBytes) {
+    const float32 = pcm16ToFloat32(pcmBytes);
+    this.pending.push(float32);
+    this.pendingSamples += float32.length;
+    this._schedule();
+  }
+
+  finish() {
+    this.ended = true;
+    this._schedule();
+  }
+
+  _schedule() {
+    if (!this.started) {
+      const ready = this.pendingSamples >= this.minBufferSamples || this.ended;
+      if (!ready) return;
+      this.started = true;
+      this.playTime = Math.max(this.playTime, this.ctx.currentTime);
+    }
+
+    while (this.pending.length > 0) {
+      const ahead = this.playTime - this.ctx.currentTime;
+      if (ahead > this.maxAheadSec) break;
+
+      const float32 = this.pending.shift();
+      this.pendingSamples -= float32.length;
+
+      const buffer = this.ctx.createBuffer(1, float32.length, this.sampleRate);
+      buffer.copyToChannel(float32, 0);
+      const source = this.ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(this.ctx.destination);
+      const startAt = Math.max(this.playTime, this.ctx.currentTime);
+      source.start(startAt);
+      this.playTime = startAt + buffer.duration;
+    }
+  }
 }
 
 speedEl.addEventListener("input", () => {
@@ -209,9 +265,7 @@ async function speak() {
   let firstByteMs = null;
 
   try {
-    await ensureAudioCtx();
-    playTime = audioCtx.currentTime;
-
+    const ctx = await ensureAudioCtx();
     const res = await fetch("/tts/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -220,6 +274,9 @@ async function speak() {
     if (!res.ok) throw new Error(await res.text());
 
     const sampleRate = parseInt(res.headers.get("X-Sample-Rate") || "24000", 10);
+    const streamPlayer = new StreamPlayer(ctx, sampleRate);
+    streamPlayer.reset();
+
     const reader = res.body.getReader();
     let bytes = 0;
 
@@ -228,15 +285,15 @@ async function speak() {
       if (done) break;
       if (firstByteMs === null) {
         firstByteMs = (performance.now() - start).toFixed(0);
-        log(`playing… first audio in ${firstByteMs}ms`);
+        log(`buffering… first chunk in ${firstByteMs}ms`);
       }
-
       bytes += value.byteLength;
-      scheduleChunk(pcm16ToFloat32(value), sampleRate);
+      streamPlayer.push(value);
     }
 
+    streamPlayer.finish();
     const totalMs = (performance.now() - start).toFixed(0);
-    log(`done — first audio ${firstByteMs}ms, total ${totalMs}ms (${bytes} bytes)`);
+    log(`playing — first chunk ${firstByteMs}ms, stream ${totalMs}ms (${bytes} bytes)`);
   } catch (e) {
     log(`Error: ${e.message}`);
   } finally {
