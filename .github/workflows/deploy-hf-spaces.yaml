@@ -1,0 +1,72 @@
+name: Deploy to Hugging Face Spaces
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-space-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy to HF Space
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate required settings
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SPACE_ID: ${{ vars.HF_SPACE_ID }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${HF_TOKEN:-}" ]]; then
+            echo "Missing secrets.HF_TOKEN (Hugging Face write token)." >&2
+            exit 1
+          fi
+          if [[ -z "${SPACE_ID:-}" ]]; then
+            echo "Missing vars.HF_SPACE_ID (e.g. username/vayumi-audio)." >&2
+            exit 1
+          fi
+
+      - name: Install git-lfs
+        run: |
+          set -euo pipefail
+          git lfs install
+
+      - name: Push repo to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SPACE_ID: ${{ vars.HF_SPACE_ID }}
+        run: |
+          set -euo pipefail
+
+          workdir="$(mktemp -d)"
+          rsync -a --delete --exclude ".git" --exclude ".github" ./ "$workdir/"
+
+          cd "$workdir"
+          git init
+          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name "github-actions"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No files to deploy"
+            exit 0
+          fi
+          git commit -m "Deploy from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+
+          remote="https://__token__:${HF_TOKEN}@huggingface.co/spaces/${SPACE_ID}"
+          git remote add origin "$remote"
+          git push --force origin HEAD:main
